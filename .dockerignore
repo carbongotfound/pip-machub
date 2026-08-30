@@ -1,0 +1,14 @@
+.git
+.github
+.claude
+.omb-scratch
+node_modules
+dist
+dist-companion
+dist-electron
+dist-native
+dist-server
+release
+*.tsbuildinfo
+docs/screenshots
+ios

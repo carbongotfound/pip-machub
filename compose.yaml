@@ -1,0 +1,23 @@
+services:
+  openmausbot:
+    build:
+      context: .
+    restart: unless-stopped
+    init: true
+    ports:
+      - "127.0.0.1:8810:8810"
+    environment:
+      OMB_COMPANION_NAME: Mac mini agent hub
+      # Docker's host-to-container bridge is not a loopback peer. The port is
+      # bound to host loopback above, so trusting Tailscale Serve's forwarded
+      # HTTPS headers remains scoped to the Mac.
+      OMB_PWA_TRUST_PROXY: "1"
+    volumes:
+      - openmausbot-data:/data
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=256m
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  openmausbot-data:
