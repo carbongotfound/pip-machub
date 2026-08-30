@@ -1,262 +1,266 @@
-// Grok Build harness support — the official `grok` CLI over ACP stdio
-// (`grok … agent stdio`), on the grok.com subscription login
-// (~/.grok/auth.json), NOT the xAI API key (that driver is drivers/grok.ts).
-// The generic protocol runtime lives in acp/core.ts; this file is only the
-// per-harness quirks. Verified against grok 1.0.0.
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
-import { join } from "node:path";
+// Grok driver — xAI chat-completions API with SSE streaming. Unlike the
+// CLI drivers this one is transcript-replay: the server hands it the
+// folded thread history each turn (SendTurnInput.transcript) and it emits
+// true token-level content.delta events. Also supplies the instance's
+// generateText (bot titles, thread names) — upstream's TextGeneration slot.
+import type {
+  DriverCreateInput,
+  ProviderDriver,
+  ProviderInstance,
+  ProviderSnapshot,
+  RuntimeEvent,
+  RuntimeEventListener,
+  SendTurnInput,
+} from "../contracts.ts";
+import { newEventId, newId } from "../contracts.ts";
+import { classifyError, computeBackoff, interruptibleDelay, RETRY_MAX_ATTEMPTS } from "./retry.ts";
+import { appendNative } from "./native.ts";
 
-import type { ModelCatalog } from "../../contracts.ts";
-import { decodeInjectId, hostApiKey, localHost, mergeLocalInject } from "../local-inject.ts";
-import { createAcpDriver, type AcpSupport } from "./core.ts";
+const DRIVER_KIND = "grok";
+const DEFAULT_URL = "https://api.x.ai/v1";
 
-export const STATIC_GROK_MODELS: ModelCatalog = {
-  default: "grok-4.6",
+const MODELS = {
+  default: "grok-4",
   options: [
-    { id: "grok-4.6", label: "Grok 4.6" },
-    { id: "grok-4.5", label: "Grok 4.5" },
+    { id: "grok-4", label: "Grok 4" },
+    { id: "grok-4-fast", label: "Grok 4 Fast" },
+    { id: "grok-3-mini", label: "Grok 3 Mini" },
   ],
 };
 
-const SLUG = /^[a-z0-9][a-z0-9._-]*$/i;
-
-function grokHome(env: Record<string, string | undefined>): string {
-  if (env.GROK_HOME) return env.GROK_HOME;
-  return join(env.HOME || env.USERPROFILE || homedir(), ".grok");
+export interface GrokConfig {
+  url: string;
+  /** resolved at create-time from instance environment / app config */
+  apiKeyEnv: string;
 }
 
-function unquote(raw: string): string {
-  const value = raw.trim();
-  if (value.length >= 2 && value.startsWith('"') && value.endsWith('"')) {
-    return value.slice(1, -1).replace(/\\"/g, '"');
-  }
-  return value;
-}
-
-/** Local slugs from ~/.grok/config.toml, plus the two cloud defaults.
- *  `grok -m <slug>` already accepts these; the picker just didn't list them. */
-export function readGrokModelCatalog(env: Record<string, string | undefined> = process.env): ModelCatalog {
-  const path = join(grokHome(env), "config.toml");
-  let text = "";
-  try {
-    text = readFileSync(path, "utf8");
-  } catch {
-    return STATIC_GROK_MODELS;
-  }
-
-  const options = STATIC_GROK_MODELS.options.map((o) => ({ ...o }));
-  const seen = new Set(options.map((o) => o.id));
-  let configuredDefault: string | null = null;
-  let current: { slug: string; name?: string } | null = null;
-  let inModels = false;
-
-  const flush = () => {
-    if (!current || !SLUG.test(current.slug) || seen.has(current.slug)) {
-      current = null;
-      return;
-    }
-    seen.add(current.slug);
-    options.push({ id: current.slug, label: current.name || current.slug, custom: true });
-    current = null;
-  };
-
-  for (const line of text.split(/\r?\n/)) {
-    const stripped = line.trim();
-    if (stripped === "[models]") {
-      flush();
-      inModels = true;
-      continue;
-    }
-    if (stripped.startsWith("[model.") && stripped.endsWith("]")) {
-      flush();
-      inModels = false;
-      let inner = stripped.slice("[model.".length, -1);
-      if (inner.startsWith('"') && inner.endsWith('"')) inner = inner.slice(1, -1);
-      current = { slug: inner };
-      continue;
-    }
-    if (stripped.startsWith("[")) {
-      flush();
-      inModels = false;
-      continue;
-    }
-    if (!stripped || stripped.startsWith("#") || !stripped.includes("=")) continue;
-    const eq = stripped.indexOf("=");
-    const key = stripped.slice(0, eq).trim();
-    const value = unquote(stripped.slice(eq + 1));
-    if (current && key === "name" && value) current.name = value;
-    if (!current && inModels && key === "default") configuredDefault = value;
-  }
-  flush();
-
+function decodeConfig(raw: unknown): GrokConfig {
+  const o = (raw ?? {}) as Record<string, unknown>;
   return {
-    default: configuredDefault && seen.has(configuredDefault) ? configuredDefault : STATIC_GROK_MODELS.default,
-    options,
+    url: typeof o.url === "string" ? o.url : DEFAULT_URL,
+    apiKeyEnv: typeof o.apiKeyEnv === "string" ? o.apiKeyEnv : "XAI_API_KEY",
   };
 }
 
-function suggestGrokSlug(host: string, model: string, taken: Set<string>): string {
-  let base = `${host}-${model}`.toLowerCase().replace(/[^a-z0-9._-]+/g, "-").replace(/-+/g, "-").replace(/^-|-$/g, "");
-  if (!base || !/^[a-z]/.test(base)) base = `m-${base || "model"}`;
-  let slug = base;
-  let n = 2;
-  while (taken.has(slug)) {
-    slug = `${base}-${n}`;
-    n += 1;
-  }
-  return slug;
-}
+export const GrokDriver: ProviderDriver<GrokConfig> = {
+  driverKind: DRIVER_KIND,
+  // "(API)" distinguishes this key-billed driver from grokAgent, the CLI one
+  metadata: { displayName: "Grok (API)", supportsMultipleInstances: true },
+  models: MODELS,
+  decodeConfig,
+  defaultConfig: () => decodeConfig({}),
 
-function quoteToml(value: string): string {
-  return `"${value.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
-}
+  async create(input: DriverCreateInput<GrokConfig>): Promise<ProviderInstance> {
+    const { instanceId, config } = input;
+    const apiKey = input.environment[config.apiKeyEnv] ?? process.env[config.apiKeyEnv] ?? "";
+    const listeners = new Set<RuntimeEventListener>();
+    const active = new Map<string, { abort: AbortController; turnId: string }>();
 
-/** Write a [model.slug] block so `grok -m` can reach the injected host. */
-export function ensureGrokInjectSlug(
-  modelId: string,
-  env: Record<string, string | undefined> = process.env,
-): string {
-  const inject = decodeInjectId(modelId);
-  if (!inject) return modelId;
-  const host = localHost(inject.host);
-  if (!host) return modelId;
+    const emit = (event: RuntimeEvent) => {
+      for (const l of [...listeners]) l(event);
+    };
+    const base = (threadId: string, turnId: string) => ({
+      eventId: newEventId(),
+      provider: DRIVER_KIND,
+      threadId,
+      turnId,
+      createdAt: new Date().toISOString(),
+    });
 
-  const path = join(grokHome(env), "config.toml");
-  let text = "";
-  try {
-    text = readFileSync(path, "utf8");
-  } catch {
-    text = "";
-  }
+    const complete = async (
+      messages: Array<{ role: string; content: string }>,
+      model: string,
+      opts: { stream: boolean; signal?: AbortSignal; onDelta?: (d: string) => void },
+    ): Promise<{ text: string; usage: { input: number; output: number } | null }> => {
+      const res = await fetch(`${config.url}/chat/completions`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${apiKey}`, "content-type": "application/json" },
+        body: JSON.stringify({ model, messages, stream: opts.stream }),
+        signal: opts.signal ?? AbortSignal.timeout(120_000),
+      });
+      if (!res.ok) {
+        const body = await res.text().catch(() => "");
+        throw new Error(`xAI HTTP ${res.status}${body ? `: ${body.slice(0, 200)}` : ""}`);
+      }
+      if (!opts.stream) {
+        const json: any = await res.json();
+        return {
+          text: json.choices?.[0]?.message?.content ?? "",
+          usage: json.usage
+            ? { input: json.usage.prompt_tokens ?? 0, output: json.usage.completion_tokens ?? 0 }
+            : null,
+        };
+      }
+      let text = "";
+      let usage: { input: number; output: number } | null = null;
+      const reader = res.body!.getReader();
+      const decoder = new TextDecoder();
+      let buf = "";
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+        let nl;
+        while ((nl = buf.indexOf("\n")) !== -1) {
+          const line = buf.slice(0, nl).trim();
+          buf = buf.slice(nl + 1);
+          if (!line.startsWith("data:")) continue;
+          const data = line.slice(5).trim();
+          if (data === "[DONE]") continue;
+          let chunk: any;
+          try {
+            chunk = JSON.parse(data);
+          } catch {
+            continue;
+          }
+          const delta = chunk.choices?.[0]?.delta?.content;
+          if (delta) {
+            text += delta;
+            opts.onDelta?.(delta);
+          }
+          if (chunk.usage) {
+            usage = { input: chunk.usage.prompt_tokens ?? 0, output: chunk.usage.completion_tokens ?? 0 };
+          }
+        }
+      }
+      return { text, usage };
+    };
 
-  const taken = new Set<string>(STATIC_GROK_MODELS.options.map((option) => option.id));
-  let current: { slug: string; model?: string; baseUrl?: string } | null = null;
-  const flush = () => {
-    if (!current) return;
-    taken.add(current.slug);
-    if (current.model === inject.model && current.baseUrl === host.baseUrl) {
-      found = current.slug;
-    }
-    current = null;
-  };
-  let found: string | null = null;
-  for (const line of text.split(/\r?\n/)) {
-    const stripped = line.trim();
-    if (stripped.startsWith("[model.") && stripped.endsWith("]")) {
-      flush();
-      let inner = stripped.slice("[model.".length, -1);
-      if (inner.startsWith('"') && inner.endsWith('"')) inner = inner.slice(1, -1);
-      current = { slug: inner };
-      continue;
-    }
-    if (stripped.startsWith("[")) {
-      flush();
-      continue;
-    }
-    if (!current || !stripped.includes("=")) continue;
-    const eq = stripped.indexOf("=");
-    const key = stripped.slice(0, eq).trim();
-    const value = unquote(stripped.slice(eq + 1));
-    if (key === "model") current.model = value;
-    if (key === "base_url") current.baseUrl = value;
-  }
-  flush();
-  if (found) return found;
+    const sendTurn = async (turn: SendTurnInput) => {
+      const { threadId } = turn;
+      if (!apiKey) throw new Error(`no xAI key — set ${config.apiKeyEnv} or config.json xai.key`);
+      if (active.has(threadId)) throw new Error("a turn is already running on this thread");
+      const turnId = newId();
+      const abort = new AbortController();
+      let streamedText = false;
+      // the backoff is scaled down in tests so a fake's transient failures
+      // don't stall real seconds
+      const retryScale = Number(process.env.FAKE_GROK_RETRY_SCALE ?? "1");
+      active.set(threadId, { abort, turnId });
 
-  const slug = suggestGrokSlug(inject.host, inject.model, taken);
-  const heading = /[^a-z0-9_-]/i.test(slug) ? `[model."${slug}"]` : `[model.${slug}]`;
-  const block = [
-    heading,
-    `model = ${quoteToml(inject.model)}`,
-    `base_url = ${quoteToml(host.baseUrl)}`,
-    `name = ${quoteToml(`${inject.model} (${host.label})`)}`,
-    `api_backend = "chat_completions"`,
-    `api_key = ${quoteToml(hostApiKey(host, env))}`,
-    "",
-  ].join("\n");
-  const next = text && !text.endsWith("\n") ? `${text}\n\n${block}` : `${text}${text ? "\n" : ""}${block}`;
-  writeFileSync(path, next);
-  return slug;
-}
+      const messages = [
+        ...(turn.system ? [{ role: "system", content: turn.system }] : []),
+        ...(turn.transcript ?? []).map((m) => ({
+          role: m.role === "assistant" ? "assistant" : "user",
+          content: m.text,
+        })),
+        { role: "user", content: turn.text },
+      ];
+      appendNative(threadId, { dir: "out", source: "xai.chat.completions", msg: { model: turn.model, messages } });
 
-const support: AcpSupport = {
-  driverKind: "grokAgent",
-  displayName: "Grok",
-  images: false,
-  models: STATIC_GROK_MODELS,
-  resolveModels: (env) => mergeLocalInject(readGrokModelCatalog(env), env),
-  // Grok's accepted levels vary by model and the CLI validates lazily — a
-  // rejected level only logs and falls back. Offer the intersection shared
-  // by every model in this driver's picker; notably, grok-4.5 rejects xhigh.
-  effortLevels: ["low", "medium", "high"],
-  defaultCli: "grok",
-  nativeSource: "grok.acp",
-  loginNote: "Grok CLI is not signed in — run `grok login` in a terminal",
+      emit({ ...base(threadId, turnId), type: "turn.started" });
+      emit({ ...base(threadId, turnId), type: "session.started", sessionId: null, model: turn.model ?? MODELS.default });
 
-  // No Windows one-liner: the installer is a POSIX shell script, and offering
-  // `curl … | bash` there would be advice that cannot run. Windows falls back
-  // to docsUrl, which is honest rather than broken.
-  install: {
-    command: {
-      darwin: "curl -fsSL https://x.ai/cli/install.sh | bash",
-      linux: "curl -fsSL https://x.ai/cli/install.sh | bash",
-    },
-    docsUrl: "https://x.ai/cli",
-    signInCommand: "grok login",
+      (async () => {
+        let attempt = 0;
+        for (;;) {
+          try {
+            const { text, usage } = await complete(messages, turn.model || MODELS.default, {
+              stream: true,
+              signal: abort.signal,
+              onDelta: (delta) => {
+                streamedText = true;
+                emit({ ...base(threadId, turnId), type: "content.delta", streamKind: "assistant_text", delta });
+              },
+            });
+            appendNative(threadId, { dir: "in", source: "xai.chat.completions", msg: { text, usage } });
+            if (text.trim()) {
+              emit({ ...base(threadId, turnId), type: "item.completed", itemType: "assistant_text", text });
+            }
+            if (usage) {
+              emit({ ...base(threadId, turnId), type: "thread.token-usage.updated", ...usage });
+            }
+            active.delete(threadId);
+            emit({ ...base(threadId, turnId), type: "turn.completed", ok: true, stopReason: null, cost: null });
+            return;
+          } catch (e) {
+            const aborted = (e as Error).name === "AbortError";
+            const failure = e instanceof Error ? e : { text: String(e) };
+            const verdict = classifyError(failure);
+            if (!aborted && !streamedText && verdict.transient && attempt < RETRY_MAX_ATTEMPTS - 1) {
+              const delayMs = computeBackoff(attempt);
+              attempt++;
+              emit({
+                ...base(threadId, turnId),
+                type: "turn.retrying",
+                attempt,
+                delayMs,
+                reason: verdict.reason,
+              });
+              const wait = interruptibleDelay(delayMs * retryScale, abort.signal);
+              const outcome = await wait.promise;
+              if (outcome === "cancelled" || abort.signal.aborted) {
+                active.delete(threadId);
+                emit({
+                  ...base(threadId, turnId),
+                  type: "turn.completed",
+                  ok: false,
+                  stopReason: "interrupted",
+                  cost: null,
+                });
+                return;
+              }
+              continue;
+            }
+            active.delete(threadId);
+            if (!aborted) {
+              emit({ ...base(threadId, turnId), type: "runtime.error", message: (e as Error).message });
+            }
+            emit({
+              ...base(threadId, turnId),
+              type: "turn.completed",
+              ok: false,
+              stopReason: aborted ? "interrupted" : "error",
+              cost: null,
+            });
+            return;
+          }
+        }
+      })();
+
+      return { turnId };
+    };
+
+    const snapshot = async (): Promise<ProviderSnapshot> => {
+      if (!apiKey) {
+        return {
+          state: "unavailable",
+          reason: `no xAI API key — add {"xai":{"key":"xai-…"}} to ~/.openmausbot/config.json or set ${config.apiKeyEnv}`,
+        };
+      }
+      return { state: "available", authenticated: true, version: null };
+    };
+
+    return {
+      instanceId,
+      driverKind: DRIVER_KIND,
+      displayName: input.displayName,
+      enabled: input.enabled,
+      models: MODELS,
+      snapshot,
+      adapter: {
+        provider: DRIVER_KIND,
+        capabilities: { sessionModelSwitch: "in-session" },
+        sendTurn,
+        interruptTurn: async (threadId) => active.get(threadId)?.abort.abort(),
+        respondToRequest: async () => "unavailable" as const, // this engine has no asks to answer
+        hasSession: (threadId) => active.has(threadId),
+        stopAll: async () => {
+          for (const { abort } of active.values()) abort.abort();
+        },
+        onEvent: (listener) => {
+          listeners.add(listener);
+          return () => listeners.delete(listener);
+        },
+      },
+      generateText: async (prompt: string) => {
+        const { text } = await complete([{ role: "user", content: prompt }], "grok-3-mini", { stream: false });
+        return text;
+      },
+      dispose: async () => {
+        for (const { abort } of active.values()) abort.abort();
+        listeners.clear();
+      },
+    };
   },
-
-  // Write the [model.slug] block with the instance HOME/GROK_HOME, then pass
-  // the slug on argv. spawnArgs must not call ensureGrokInjectSlug itself —
-  // that helper defaults to process.env and would miss the instance override.
-  resolveTurnModel: (model, env) => (model ? ensureGrokInjectSlug(model, env) : model),
-
-  // --permission-mode is a global grok flag. -m and --reasoning-effort are
-  // agent flags: Grok 1.0.6 only applies them when they sit AFTER `agent`
-  // and BEFORE `stdio` (`grok agent -m slug stdio`). Putting -m first is
-  // accepted as a TUI option and then ignored, so ACP session/new keeps
-  // [models].default (grok-4.6) and oMLX never sees a request.
-  spawnArgs: (config, turn) => [
-    "--permission-mode",
-    config.fullAuto ? "bypassPermissions" : "default",
-    "agent",
-    ...(turn.model ? ["-m", turn.model] : []),
-    // long form on purpose: `--effort` is documented as an alias, and an
-    // alias is the part a CLI is free to rename
-    ...(turn.effort ? ["--reasoning-effort", turn.effort] : []),
-    "stdio",
-  ],
-
-  // -m on argv is necessary but not sufficient: session/new still starts on
-  // [models].default. Pin the slug over the wire, same as Hermes/Droid.
-  async configureSession({ request, sessionId, turn }) {
-    if (!turn.model) return;
-    try {
-      await request("session/set_model", { sessionId, modelId: turn.model });
-    } catch (e) {
-      throw new Error(
-        `Grok rejected model "${turn.model}" via session/set_model: ${(e as Error).message}. ` +
-          `Check that grok is current (1.0.6+ supports it) and that this slug exists in ~/.grok/config.toml.`,
-      );
-    }
-  },
-
-  // The CLI owns its own grok.com login; a leaked API key silently flips
-  // billing from the subscription to pay-as-you-go.
-  transformEnv: (env) => {
-    delete env.XAI_API_KEY;
-  },
-
-  // Bind the grok.com subscription login. No API-key fallback by design —
-  // an unauthenticated CLI is a user action, not something to paper over.
-  pickAuthMethod: (methods) => (methods.some((m) => m.id === "cached_token") ? "cached_token" : null),
-  authFailure: "fail",
-  isAuthenticated: () => existsSync(join(homedir(), ".grok", "auth.json")),
-
-  // `--append-system-prompt`/`--rules` are accepted by the CLI but do NOT
-  // reach the agent-stdio system prompt (verified against 1.0.0), so the
-  // persona is prepended codex-style.
-  buildPromptText: (turn) => (turn.system ? `${turn.system}\n\n${turn.text}` : turn.text),
 };
-
-export const GrokAgentDriver = createAcpDriver(support);
