@@ -1,6 +1,6 @@
 # Pip
 
-Pip is a local-first desktop hub for a private team of customizable AI characters. Run agents from your Mac, give each one its own personality and working context, and chat with them like contacts.
+Pip is an open-source, local-first Grok Bot alternative: a desktop hub for a private team of customizable AI characters. Run agents from your Mac, give each one its own personality and working context, and chat with them like contacts.
 
 > Pip is an experimental open-source project. It is designed to run locally and connect to remote devices through a private network.
 
