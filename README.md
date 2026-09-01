@@ -10,7 +10,15 @@ Give each character its own role, model, tools, working folder, approvals, and c
 
 **Pip is an experimental, open-source Grok Bot alternative for people who want a private team of customizable AI characters.**
 
-<img src="docs/screenshots/hero.png" alt="Pip's agent workspace" width="900">
+**Quick start on macOS**
+
+```bash
+git clone https://github.com/carbongotfound/pip-machub.git && cd pip-machub && chmod +x SETUP-MAC.command && ./SETUP-MAC.command
+```
+
+The setup wizard checks your Mac, installs the locked dependencies, runs the safety checks, and builds Pip locally. It needs macOS, Git, and Node.js 24 or newer.
+
+<img src="docs/hero.png" alt="Pip's agent workspace" width="900">
 
 </div>
 
@@ -44,7 +52,7 @@ Pip is an experimental fork built from the OpenMausBot codebase, released under 
 
 Choose different models and settings per character. A researcher does not need to behave like the builder, and neither needs to behave like your assistant with a fake moustache.
 
-<img src="docs/screenshots/model-picker.png" alt="Model picker" width="100%">
+<img src="docs/model-picker.png" alt="Model picker" width="100%">
 
 </td>
 <td width="50%" valign="top">
@@ -53,7 +61,7 @@ Choose different models and settings per character. A researcher does not need t
 
 Questions, tool activity, and approvals stay in the thread, so an agent action does not become a mysterious thing that happened somewhere else.
 
-<img src="docs/screenshots/approval-card.png" alt="Approval card in chat" width="100%">
+<img src="docs/approval-card.png" alt="Approval card in chat" width="100%">
 
 </td>
 </tr>
@@ -64,7 +72,7 @@ Questions, tool activity, and approvals stay in the thread, so an agent action d
 
 Open a computer panel for an agent, inspect its work, and take over when needed.
 
-<img src="docs/screenshots/computer-panel.png" alt="Agent computer panel" width="100%">
+<img src="docs/computer-panel.png" alt="Agent computer panel" width="100%">
 
 </td>
 <td width="50%" valign="top">
@@ -73,7 +81,7 @@ Open a computer panel for an agent, inspect its work, and take over when needed.
 
 Characters are people-shaped on purpose. Their job, context, tools, and history are all visible from the workspace instead of buried inside a prompt.
 
-<img src="docs/screenshots/context-menu.png" alt="Agent context menu" width="100%">
+<img src="docs/context-menu.png" alt="Agent context menu" width="100%">
 
 </td>
 </tr>
@@ -83,7 +91,7 @@ Characters are people-shaped on purpose. Their job, context, tools, and history 
 
 The fastest useful test is an artifact handoff:
 
-1. Create a **Builder** and a **Reviewer**.
+1. Create a **Builder** and a **Reviewer*.
 2. Ask Builder to make a small webpage in its working folder.
 3. Ask Reviewer to inspect and improve the actual files, not a summary of what Builder says it made.
 4. Report where the handoff breaks, feels confusing, or needs another approval screen.
@@ -96,27 +104,27 @@ Pip is source code at the moment, not a signed app download.
 
 1. Read [SETUP.md](SETUP.md).
 2. Install Node.js 24 or newer, pnpm, and Apple's command-line tools.
-3. Run SETUP-MAC.command and follow the wizard.
-4. For ChatGPT access, sign in through the official Codex CLI with codex login.
+3. Run `SETUP-MAC.command` and follow the wizard.
+4. For ChatGPT access, sign in through the official Codex CLI with `codex login`.
 
 Keep approvals enabled until you understand what an agent can do. The Mac stores the local hub data. Read [PWA and Tailscale setup](docs/PWA-TAILSCALE.md) before enabling phone or Windows access.
 
 ### Development
 
-~~~sh
+```sh
 pnpm install
 pnpm dev:server
 pnpm dev
 pnpm dev:desktop
-~~~
+```
 
 Useful commands:
 
-~~~sh
+```sh
 pnpm typecheck
 pnpm lint
 pnpm test
-~~~
+```
 
 ## How it is structured
 
@@ -128,14 +136,6 @@ pnpm test
 
 ## Security
 
-Pip can give agents powerful tools. Use it on a private network, keep approvals enabled, and read [SECURITY-RED-TEAM.md](docs/SECURITY-RED-TEAM.md) and [PRODUCTION-READINESS.md](docs/PRODUCTION-READINESS.md) before unattended use.
-
-Never put passwords, ChatGPT credentials, API keys, or private tokens in this repository. Do not expose the Mac hub directly to the public internet.
-
-## Contributing
-
-Bug reports, documentation improvements, tests, and provider drivers are welcome. If you try Pip, the most useful report is a real workflow that failed, including what you expected the agent team to do and where it went sideways.
-
-## License
-
-Pip is released under the Apache License 2.0.
+�\�[��]�HY�[����\��[��ˈ\�H]ۈH�]�]H�]�ܚ��Y\\�ݘ[�[�X�Y[��XY��P�T�UKT�QUPSK�YJ�����P�T�UKT�QUPSK�Y
+H[����P�SӋT�PQS�T�˛YJ������P�SӋT�PQS�T�˛Y
+H�Y�ܙH[�][�Y\�K����]�\�]\���ܙ��]�ܙY[�X[�TH�^\�܈�]�]H��[��[�\��\��]ܞK����^��HHXX�X�\�X�H�HX�X�[�\��]������۝�X�][���Y��\ܝ���[Y[�][ۈ[\�ݙ[Y[��\��[��ݚY\��]�\��\�H�[��YK�Y�[�H�H\H[��\�Y�[�\ܝ\�H�X[�ܚٛ��]�Z[Y[��Y[���][�H^X�YHY�[�X[H��[��\�H]�[��Y]�^\˂����X�[��B��\\��[X\�Y[�\�H\X�HX�[��H���
